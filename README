@@ -1,0 +1,119 @@
+# PlasmaSim v3.0 – Research-Grade 1D Electrostatic PIC Simulator
+
+A high-fidelity, monolithic 1D electrostatic Particle-in-Cell (PIC) code designed for reproducible plasma physics research and educational use. The code supports electron-ion simulations with a uniform background magnetic field **B_z**, using the relativistic Boris pusher, tri-quadratic spline (TSC) charge deposition/field interpolation, and spectral Poisson solve.
+
+Normalized units:  
+- Electron plasma frequency: **ω_pe = 1**  
+- Electron Debye length: **λ_De = 1**  
+- Electron charge: **q_e = -1**  
+- Electron mass: **m_e = 1**
+
+## Key Features
+
+- **JSON configuration** (`config.json`) for easy parameter overrides
+- **Reproducible runs** via fixed random seed
+- **Full HDF5 output** for post-processing and reproducibility
+- Comprehensive diagnostics: kinetic/potential/total energy, momentum conservation, mode amplitude history
+- Live Matplotlib visualization during runs (phase space, fields, conservation plots)
+- Robust **Landau damping** analysis with automatic growth-rate fitting and comparison to fluid theory
+- Support for multiple simulation modes:  
+  - `landau` – classic Landau damping with sinusoidal velocity perturbation  
+  - `two_stream` – electron two-stream instability  
+  - `cyclotron_test` – drifting electrons in **B_z** for cyclotron motion validation
+- Numba-accelerated core routines for excellent performance
+- Binomial filtering (3-pass) to reduce short-wavelength noise
+- Periodic boundary conditions
+
+## Requirements
+
+- Python 3.8+
+- numpy
+- matplotlib
+- scipy
+- numba
+- h5py
+
+Install with:
+
+```bash
+pip install numpy matplotlib scipy numba h5py
+```
+
+## Quick Start
+
+1. Save the script as `PlasmaSim.py`.
+2. (Optional) Create a `config.json` file to override default parameters (see example below).
+3. Run the simulation:
+
+```bash
+python3 PlasmaSim.py
+```
+
+The code will create an output directory `pic_output/` containing an HDF5 file with full time history of fields, diagnostics, and configuration metadata.
+
+Live plots will appear every `plot_every` steps (default 50).
+
+## Configuration (`config.json`)
+
+Example `config.json` (all fields optional – missing ones use defaults):
+
+```json
+{
+    "L": 50.0,                  // Domain length in λ_De
+    "NG": 512,                  // Number of grid points
+    "NP_E": 100000,             // Number of electron macro-particles (ions = same number)
+    "dt": 0.05,                  // Time step (ω_pe⁻¹)
+    "steps": 2000,              // Total number of time steps
+    "plot_every": 50,           // Live plot interval
+    "output_every": 50,         // HDF5 snapshot interval
+    "output_dir": "pic_output", // Output directory
+    "mi_me": 1836.0,            // Proton/electron mass ratio
+    "B0": 1.0,                  // Background B_z (ω_ce = ω_pe when B0=1)
+    "mode": 2,                  // Excited mode number k = 2π mode / L
+    "amp": 0.05,                // Velocity perturbation amplitude
+    "SIM_MODE": "landau",       // "landau", "two_stream", or "cyclotron_test"
+    "seed": 42                  // Random seed for reproducibility
+}
+```
+
+## Simulation Modes
+
+- **`landau`** (default)  
+  Small sinusoidal velocity perturbation on a Maxwellian plasma. Excellent test of Landau damping. After the run, the code automatically computes the numerical damping rate and compares it to the classical fluid theory result γ ≈ -0.1533 k² exp(-1/(2k²)).
+
+- **`two_stream`**  
+  Counter-streaming electron beams (±2 v_th) with small spatial density modulation. Demonstrates two-stream instability.
+
+- **`cyclotron_test`**  
+  Cold electron drift (v_d = 1) in a background B_z field. Useful for verifying correctness of the Boris pusher and cyclotron motion.
+
+## Output
+
+- HDF5 file (`pic_run_YYYYMMDD_HHMMSS.h5`) containing:
+  - Grid (`x_grid`)
+  - Snapshot times (`times`)
+  - Per-snapshot groups (`step_XXXX`):
+    - `efield` (E_x on grid)
+    - `rho_pert` (charge density perturbation)
+    - Attributes: kinetic energy, potential energy, total energy, momentum, mode amplitude
+  - Global attributes: full configuration and timestamp
+
+- Console output:
+  - Conservation diagnostics
+  - For Landau runs: numerical vs. theoretical damping rate with relative error
+
+## Post-Processing
+
+The HDF5 format is easily readable with Python (`h5py`), MATLAB, or Julia for custom analysis and publication-quality plots.
+
+## License & Citation
+
+This code is provided freely for research and educational use. If you use it in published work, please cite it appropriately as:
+
+> "PlasmaSim v3.0 – 1D Electrostatic PIC Simulator" (2025), open-source code available at [repository link].
+
+## Acknowledgments
+
+Built with performance and clarity in mind, drawing on standard techniques from Birdsall & Langdon and modern Python/Numba best practices.
+
+Enjoy simulating plasmas!
