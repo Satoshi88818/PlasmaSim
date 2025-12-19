@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""
+Educational 1D Electrostatic Particle-in-Cell (PIC) Simulation
+with Ions, Uniform Background Magnetic Field (B_z), and Landau Damping
+
+This script demonstrates three classic plasma physics phenomena:
+1. Landau damping (single species or electron-ion)
+2. Two-stream instability (optional)
+3. Cyclotron motion due to B_z magnetic field
+
+Features:
+- Two species: electrons and ions (different mass/charge ratios)
+- Uniform out-of-plane magnetic field B = (0, 0, B0)
+- Velocity perturbation for Landau damping initialization
+- Boris particle pusher for accurate E × B and cyclotron motion
+- Periodic boundaries
+- FFT-based Poisson solver
+- Energy conservation diagnostics
+- Phase space and field plots
+
+Units are normalized:
+- ω_pe = 1 (electron plasma frequency)
+- λ_De = 1 (electron Debye length)
+- Electron charge q_e = -1, mass m_e = 1
+- Ion charge q_i = +1, mass m_i = mi/me (default 1836 for proton)
+
+Run: python3 pic_landau_ions_bfield.py
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import animation
+
+# ====================== PARAMETERS ======================
+L = 50.0                  # Domain length (in λ_De)
+NG = 512                  # Number of grid points
+dx = L / NG
+x_grid = np.linspace(0, L, NG, endpoint=False)
+
+# Particles
+NP_E = 200000             # Number of electron macro-particles
+NP_I = NP_E               # Equal number for quasineutrality
+NP_TOTAL = NP_E + NP_I
+
+dt = 0.05                 # Time step (must satisfy CFL and cyclotron resolution)
+steps = 2000              # Total time steps
+plot_every = 50           # Plot interval
+
+# Physics parameters
+mi_me = 1836.0            # Ion-to-electron mass ratio (realistic proton)
+B0 = 1.0                  # Magnetic field strength B_z (in units where ω_ce = |q_e|B/m_e = B0)
+mode = 2                  # Excitation mode number k = 2π mode / L
+amp = 0.05                # Velocity perturbation amplitude
+
+# Simulation mode selector
+SIM_MODE = "landau"       # Options: "landau", "two_stream", "cyclotron_test"
+# "landau": Landau damping with ions and B field
+# "two_stream": Electron two-stream (ions as uniform background)
+# "cyclotron_test": No perturbation, just cyclotron orbits
+
+# ========================================================
+
+# Initialize particles
+def initialize_particles():
+    # Uniform spatial distribution
+    pos_e = np.random.uniform(0, L, NP_E)
+    pos_i = np.random.uniform(0, L, NP_I)
+    positions = np.concatenate([pos_e, pos_i])
+
+    if SIM_MODE == "two_stream":
+        # Two counter-streaming electron beams
+        vel_e = np.where(np.random.rand(NP_E) < 0.5, 2.0, -2.0)
+        vel_i = np.zeros(NP_I)  # Ions stationary
+        # Small position perturbation to seed instability
+        positions[:NP_E] += 0.01 * np.random.normal(size=NP_E)
+
+    elif SIM_MODE == "cyclotron_test":
+        # Thermal velocities + offset for visible orbits
+        vth_e = 1.0
+        vth_i = vth_e / np.sqrt(mi_me)
+        vel_e = np.random.normal(0, vth_e, NP_E)
+        vel_e += 1.0  # Drift to see rotation
+        vel_i = np.random.normal(0, vth_i, NP_I)
+    
+    else:  # landau (default)
+        # Maxwellian velocities
+        vth_e = 1.0
+        vth_i = vth_e / np.sqrt(mi_me)
+        vel_e = np.random.normal(0, vth_e, NP_E)
+        vel_i = np.random.normal(0, vth_i, NP_I)
+
+        # Sinusoidal velocity perturbation for Landau damping
+        k = 2 * np.pi * mode / L
+        pert_e = amp * np.cos(k * pos_e)
+        pert_i = amp * np.cos(k * pos_i) / np.sqrt(mi_me)  # Smaller for ions
+        vel_e[:, 0] += pert_e  # Only perturb v_x
+        vel_i += pert_i
+
+    velocities = np.zeros((NP_TOTAL, 3))
+    velocities[:NP_E, 0] = vel_e
+    velocities[NP_I:, 0] = vel_i
+
+    # Masses and charges
+    masses = np.ones(NP_TOTAL)
+    masses[NP_I:] = mi_me
+    charges = np.ones(NP_TOTAL)
+    charges[:NP_E] = -1.0  # Electrons negative
+
+    return positions, velocities, masses, charges
+
+positions, velocities, masses, charges = initialize_particles()
+
+# Diagnostics
+ke_history = []
+pe_history = []
+total_energy = []
+efield_history = []  # Store E-field amplitude for damping rate
+
+# Charge deposition (cloud-in-cell)
+def deposit_rho(pos, q):
+    rho = np.zeros(NG)
+    for i in range(NP_TOTAL):
+        p = pos[i]
+        j = int(p / dx) % NG
+        frac = (p / dx) - j
+        rho[j] += q[i] * (1 - frac)
+        rho[(j + 1) % NG] += q[i] * frac
+    return rho
+
+# FFT Poisson solver (periodic)
+def solve_efield(rho):
+    rho_hat = np.fft.rfft(rho)
+    k = 2 * np.pi * np.fft.rfftfreq(NG, dx)
+    k[0] = 1e-10  # Avoid division by zero
+    phi_hat = -rho_hat / k**2
+    phi_hat[0] = 0.0
+    phi = np.fft.irfft(phi_hat, n=NG)
+    efield = -np.gradient(phi, dx)
+    return efield
+
+# Boris pusher with E and B fields
+def boris_push(v, q, m, E_part, dt):
+    # v_minus = v^n + (q/m)(dt/2) E
+    v_minus = v + (q / m)[:, np.newaxis] * E_part * (dt / 2)
+
+    # Rotate with B: v_plus = v_minus + 2/(1 + γ²) (v_minus × t) × t + ...
+    B = np.array([0.0, 0.0, B0])
+    t = (q / m)[:, np.newaxis] * B * (dt / 2)
+    gamma2 = np.sum(t**2, axis=1)
+
+    v_prime = v_minus + np.cross(v_minus, t)
+
+    t2 = 2 * t / (1 + gamma2)[:, np.newaxis]
+    v_plus = v_minus + np.cross(v_prime, t2)
+
+    # v^{n+1} = v_plus + (q/m)(dt/2) E
+    v_new = v_plus + (q / m)[:, np.newaxis] * E_part * (dt / 2)
+
+    return v_new
+
+# Interpolate field to particles (CIC)
+def interpolate_field(pos, field_grid):
+    field_part = np.zeros((NP_TOTAL, 3))
+    for i in range(NP_TOTAL):
+        p = pos[i]
+        j = int(p / dx) % NG
+        frac = (p / dx) - j
+        field_part[i, 0] = field_grid[j] * (1 - frac) + field_grid[(j + 1) % NG] * frac
+    return field_part
+
+# Main simulation loop
+print(f"Starting {SIM_MODE} simulation with B_z = {B0}, mi/me = {mi_me}")
+
+for step in range(steps + 1):
+    # Deposit charge density
+    rho = deposit_rho(positions, charges)
+
+    # Solve for electric field
+    efield_grid = solve_efield(rho)
+    E_part = interpolate_field(positions, efield_grid)
+
+    # Push particles with Boris method
+    velocities = boris_push(velocities, charges, masses, E_part, dt)
+
+    # Advance positions
+    positions = (positions + velocities[:, 0] * dt) % L
+
+    # Diagnostics
+    if step % plot_every == 0:
+        # Energies
+        ke = 0.5 * np.sum(masses * np.sum(velocities**2, axis=1))
+        pe = 0.5 * np.sum(efield_grid**2) * dx
+        total_e = ke + pe
+
+        ke_history.append(ke)
+        pe_history.append(pe)
+        total_energy.append(total_e)
+
+        # Track E-field mode amplitude for Landau damping
+        k_mode = mode
+        phase = np.exp(1j * 2 * np.pi * k_mode * x_grid / L)
+        E_mode_amp = np.abs(np.sum(efield_grid * phase) * dx / L)
+        efield_history.append(E_mode_amp)
+
+        print(f"Step {step:4d} | KE: {ke:.4f} | PE: {pe:.6f} | Total: {total_e:.4f} | |E_mode{mode}|: {E_mode_amp:.6f}")
+
+        # Plotting
+        fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+
+        # Phase space: electrons
+        subsample = slice(0, NP_E, 20)
+        axs[0,0].scatter(positions[subsample], velocities[subsample, 0], s=1, alpha=0.6, color='blue')
+        axs[0,0].set_xlim(0, L)
+        axs[0,0].set_ylim(-4, 4)
+        axs[0,0].set_title("Electron Phase Space (x, v_x)")
+        axs[0,0].set_xlabel("Position")
+        axs[0,0].set_ylabel("v_x")
+
+        # Phase space: ions
+        subsample_i = slice(NP_E, None, 20)
+        axs[0,1].scatter(positions[subsample_i], velocities[subsample_i, 0], s=1, alpha=0.6, color='red')
+        axs[0,1].set_xlim(0, L)
+        axs[0,1].set_ylim(-0.2, 0.2)
+        axs[0,1].set_title("Ion Phase Space (x, v_x)")
+        axs[0,1].set_xlabel("Position")
+
+        # Perpendicular velocities (to see cyclotron motion)
+        axs[0,2].scatter(velocities[:NP_E:20, 1], velocities[:NP_E:20, 2], s=1, alpha=0.6, color='purple')
+        axs[0,2].set_xlim(-3, 3)
+        axs[0,2].set_ylim(-3, 3)
+        axs[0,2].set_aspect('equal')
+        axs[0,2].set_title("Electron (v_y, v_z) - Cyclotron Circles")
+        axs[0,2].set_xlabel("v_y")
+        axs[0,2].set_ylabel("v_z")
+
+        # Electric field
+        axs[1,0].plot(x_grid, efield_grid, color='green')
+        axs[1,0].set_title("Electric Field E_x")
+        axs[1,0].set_xlabel("Position")
+
+        # Charge density perturbation
+        axs[1,1].plot(x_grid, rho - np.mean(rho), color='orange')
+        axs[1,1].set_title("Charge Density Perturbation")
+        axs[1,1].set_xlabel("Position")
+
+        # Energy history
+        steps_plot = np.arange(len(ke_history)) * plot_every
+        axs[1,2].plot(steps_plot, ke_history, label='Kinetic')
+        axs[1,2].plot(steps_plot, pe_history, label='Field')
+        axs[1,2].plot(steps_plot, total_energy, label='Total', linewidth=2)
+        axs[1,2].set_title("Energy Conservation")
+        axs[1,2].set_xlabel("Time Step")
+        axs[1,2].legend()
+
+        fig.suptitle(f"{SIM_MODE.capitalize()} Simulation | t = {step*dt:.2f} | B_z = {B0}", fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+# Final damping rate analysis (for Landau mode)
+if SIM_MODE == "landau" and len(efield_history) > 10:
+    times = np.array(range(len(efield_history))) * plot_every * dt
+    amps = np.array(efield_history[1:])  # Skip initial transient
+    log_amp = np.log(amps)
+
+    # Linear fit to log amplitude → damping rate γ
+    from scipy.stats import linregress
+    slope, intercept, r_value, _, _ = linregress(times[1:], log_amp)
+    gamma = slope
+    theory_gamma = -0.1533 * (mode * 2 * np.pi / L)**2 * np.exp(-1/(2*(mode * 2 * np.pi / L)**2))  # Approx for kλ_De << 1
+
+    print(f"\nLandau Damping Analysis:")
+    print(f"Numerical damping rate γ ≈ {gamma:.6f}")
+    print(f"Theoretical (fluid) γ ≈ {theory_gamma:.6f}")
+    print(f"Agreement quality: {'Good' if abs(gamma - theory_gamma)/abs(theory_gamma) < 0.3 else 'Moderate'}")
+
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(times, efield_history, 'o-', label='Simulation |E_mode|')
+    plt.semilogy(times, np.exp(intercept + slope * times), '--', label=f'Fit γ = {gamma:.5f}')
+    plt.title("Landau Damping of Electric Field Mode")
+    plt.xlabel("Time (1/ω_pe)")
+    plt.ylabel("|E_k| (log scale)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+print("Simulation complete.")
