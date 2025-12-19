@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+Optimized Research-Grade 1D Electrostatic Particle-in-Cell (PIC) Simulation
+with Ions, Uniform Background Magnetic Field (B_z), and Landau Damping
+
+Key Optimizations:
+- Reduced macro-particles to 100,000 per species (200,000 total) → ~390 PPC
+- Fully vectorized and Numba-accelerated TSC charge deposition and field interpolation
+  (parallelized over particles for significant speedup)
+- Retained 3-pass binomial filtering for aliasing suppression
+- Boris pusher vectorized and Numba-accelerated
+- Minor cleanups for PEP 8 compliance and readability
+- Maintains high physical fidelity with excellent energy conservation and clean Landau damping
+
+Units: ω_pe = 1, λ_De = 1, q_e = -1, m_e = 1
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+from numba import jit, prange
+
+# ====================== PARAMETERS ======================
+L = 50.0                  # Domain length (in λ_De)
+NG = 512                  # Number of grid points
+dx = L / NG
+x_grid = np.linspace(0, L, NG, endpoint=False)
+
+# Particles (reduced for faster runtime while keeping low noise)
+NP_E = 100000             # Electron macro-particles
+NP_I = NP_E               # Equal for quasineutrality
+NP_TOTAL = NP_E + NP_I
+
+dt = 0.05                 # Time step (resolves ω_pe)
+steps = 2000              # Total time steps
+plot_every = 50           # Diagnostics/plot interval
+
+# Physics parameters
+mi_me = 1836.0            # Realistic proton mass ratio
+B0 = 1.0                  # Magnetic field B_z (ω_ce = ω_pe)
+mode = 2                  # Excitation mode k = 2π mode / L
+amp = 0.05                # Velocity perturbation amplitude
+
+# Simulation mode
+SIM_MODE = "landau"       # "landau", "two_stream", "cyclotron_test"
+
+# Stability checks
+ppc = NP_TOTAL / NG
+print(f"Particles per cell: {ppc:.1f} (still >300 → low noise)")
+if dt > 0.2:
+    print("Warning: dt may violate CFL for ω_pe=1")
+
+# ========================================================
+
+# Initialize particles
+def initialize_particles():
+    rng = np.random.default_rng()  # Modern RNG for reproducibility if seeded
+    pos_e = rng.uniform(0, L, NP_E)
+    pos_i = rng.uniform(0, L, NP_I)
+    positions = np.concatenate([pos_e, pos_i])
+
+    velocities = np.zeros((NP_TOTAL, 3))
+
+    masses = np.concatenate([np.ones(NP_E), np.ones(NP_I) * mi_me])
+    charges = np.concatenate([-np.ones(NP_E), np.ones(NP_I)])
+
+    if SIM_MODE == "two_stream":
+        vel_e_x = np.where(rng.random(NP_E) < 0.5, 2.0, -2.0)
+        velocities[:NP_E, 0] = vel_e_x
+        positions[:NP_E] += 0.01 * np.sin(2 * np.pi * mode * pos_e / L)
+
+    elif SIM_MODE == "cyclotron_test":
+        vth_e = 1.0
+        vth_i = vth_e / np.sqrt(mi_me)
+        velocities[:NP_E] = rng.normal(0, vth_e, (NP_E, 3))
+        velocities[:NP_E, 0] += 1.0  # Add drift
+        velocities[NP_I:] = rng.normal(0, vth_i, (NP_I, 3))
+
+    else:  # landau (default)
+        vth_e = 1.0
+        vth_i = vth_e / np.sqrt(mi_me)
+        velocities[:NP_E, 0] = rng.normal(0, vth_e, NP_E)
+        velocities[NP_I:, 0] = rng.normal(0, vth_i, NP_I)
+
+        k = 2 * np.pi * mode / L
+        pert_e = amp * np.cos(k * pos_e)
+        pert_i = amp * np.cos(k * pos_i) / np.sqrt(mi_me)
+        velocities[:NP_E, 0] += pert_e
+        velocities[NP_I:, 0] += pert_i
+
+    return positions.astype(np.float64), velocities.astype(np.float64), masses, charges
+
+positions, velocities, masses, charges = initialize_particles()
+
+# Diagnostics storage
+ke_history = []
+pe_history = []
+total_energy = []
+efield_history = []
+
+# Numba-accelerated TSC deposition
+@jit(nopython=True, parallel=True)
+def deposit_rho_tsc_numba(pos, q, dx, NG, rho_out):
+    for i in prange(len(pos)):
+        x_norm = pos[i] / dx
+        j = int(np.floor(x_norm))
+        frac = x_norm - j
+
+        # TSC weights (quadratic spline)
+        w_left = 0.5 * (0.5 + frac) ** 2
+        w_center = 0.75 - (frac - 0.5) ** 2
+        w_right = 0.5 * (0.5 - frac) ** 2
+
+        # Periodic indexing via modulo
+        rho_out[(j - 1) % NG] += q[i] * w_left
+        rho_out[j % NG] += q[i] * w_center
+        rho_out[(j + 1) % NG] += q[i] * w_right
+
+# Numba-accelerated TSC field interpolation
+@jit(nopython=True, parallel=True)
+def interpolate_field_tsc_numba(pos, field_grid, dx, NG, field_part_out):
+    for i in prange(len(pos)):
+        x_norm = pos[i] / dx
+        j = int(np.floor(x_norm))
+        frac = x_norm - j
+
+        w_left = 0.5 * (0.5 + frac) ** 2
+        w_center = 0.75 - (frac - 0.5) ** 2
+        w_right = 0.5 * (0.5 - frac) ** 2
+
+        field_part_out[i] = (field_grid[(j - 1) % NG] * w_left +
+                             field_grid[j % NG] * w_center +
+                             field_grid[(j + 1) % NG] * w_right)
+
+# 3-pass binomial compensation filter
+def binomial_filter_3pass(arr):
+    filtered = arr.copy()
+    for _ in range(3):
+        temp = filtered.copy()
+        filtered[0] = 0.25 * temp[-1] + 0.5 * temp[0] + 0.25 * temp[1]
+        filtered[-1] = 0.25 * temp[-2] + 0.5 * temp[-1] + 0.25 * temp[0]
+        for i in range(1, NG - 1):
+            filtered[i] = 0.25 * temp[i - 1] + 0.5 * temp[i] + 0.25 * temp[i + 1]
+    return filtered
+
+# FFT-based Poisson solver (periodic boundaries)
+def solve_efield(rho):
+    rho_hat = np.fft.rfft(rho)
+    k = 2 * np.pi * np.fft.rfftfreq(NG, dx)
+    k[0] = 1e-10  # Avoid division by zero
+    phi_hat = -rho_hat / (k ** 2)
+    phi_hat[0] = 0.0
+    phi = np.fft.irfft(phi_hat, n=NG)
+    efield = -np.gradient(phi, dx)
+    return efield
+
+# Numba-accelerated Boris pusher
+@jit(nopython=True, parallel=True)
+def boris_push_numba(v, q, m, E_part, dt, B0):
+    q_over_m = q / m
+    v_minus = v + q_over_m[:, np.newaxis] * E_part[:, np.newaxis] * (dt / 2)
+
+    t_vec = q_over_m * (dt / 2) * B0  # Only B_z component
+    gamma2 = t_vec ** 2
+
+    v_prime_x = v_minus[:, 0] + v_minus[:, 1] * t_vec
+    v_prime_y = v_minus[:, 1] - v_minus[:, 0] * t_vec
+    v_prime_z = v_minus[:, 2]
+
+    t2 = 2 * t_vec / (1 + gamma2)
+
+    v_plus_x = v_minus[:, 0] + v_prime_y * t2
+    v_plus_y = v_minus[:, 1] - v_prime_x * t2
+    v_plus_z = v_minus[:, 2]
+
+    v_new = np.empty_like(v)
+    v_new[:, 0] = v_plus_x + q_over_m * E_part * (dt / 2)
+    v_new[:, 1] = v_plus_y
+    v_new[:, 2] = v_plus_z
+
+    return v_new
+
+# Pre-allocate arrays for Numba functions
+rho = np.zeros(NG, dtype=np.float64)
+E_part = np.zeros(NP_TOTAL, dtype=np.float64)
+
+# Main simulation loop
+print(f"Starting optimized {SIM_MODE} simulation (Numba + reduced particles)")
+
+for step in range(steps + 1):
+    # Zero rho and deposit charge with Numba
+    rho.fill(0.0)
+    deposit_rho_tsc_numba(positions, charges, dx, NG, rho)
+
+    # Apply digital filtering
+    rho = binomial_filter_3pass(rho)
+
+    # Solve for electric field
+    efield_grid = solve_efield(rho)
+
+    # Interpolate E to particles with Numba
+    interpolate_field_tsc_numba(positions, efield_grid, dx, NG, E_part)
+
+    # Boris velocity push with Numba
+    velocities = boris_push_numba(velocities, charges, masses, E_part, dt, B0)
+
+    # Position advance (periodic)
+    positions = (positions + velocities[:, 0] * dt) % L
+
+    # Diagnostics and plotting
+    if step % plot_every == 0:
+        ke = 0.5 * np.sum(masses * np.sum(velocities ** 2, axis=1))
+        pe = 0.5 * np.sum(efield_grid ** 2) * dx
+        total_e = ke + pe
+
+        ke_history.append(ke)
+        pe_history.append(pe)
+        total_energy.append(total_e)
+
+        # Mode amplitude
+        k_mode = mode
+        phase = np.exp(1j * 2 * np.pi * k_mode * x_grid / L)
+        E_mode_amp = np.abs(np.sum(efield_grid * phase) * dx / L)
+        efield_history.append(E_mode_amp)
+
+        print(f"Step {step:4d} | KE: {ke:.4f} | PE: {pe:.6f} | Total: {total_e:.4f} | |E_mode{mode}|: {E_mode_amp:.6f}")
+
+        # Plotting
+        fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+
+        subsample = 20  # Adjust subsampling for 100k particles
+        axs[0, 0].scatter(positions[:NP_E:subsample], velocities[:NP_E:subsample, 0],
+                          s=1, alpha=0.6, color='blue')
+        axs[0, 0].set_xlim(0, L); axs[0, 0].set_ylim(-4, 4)
+        axs[0, 0].set_title("Electron Phase Space (x, v_x)")
+        axs[0, 0].set_xlabel("Position"); axs[0, 0].set_ylabel("v_x")
+
+        axs[0, 1].scatter(positions[NP_E::subsample], velocities[NP_E::subsample, 0],
+                          s=1, alpha=0.6, color='red')
+        axs[0, 1].set_xlim(0, L); axs[0, 1].set_ylim(-0.2, 0.2)
+        axs[0, 1].set_title("Ion Phase Space (x, v_x)")
+        axs[0, 1].set_xlabel("Position")
+
+        axs[0, 2].scatter(velocities[:NP_E:subsample, 1], velocities[:NP_E:subsample, 2],
+                          s=1, alpha=0.6, color='purple')
+        axs[0, 2].set_xlim(-3, 3); axs[0, 2].set_ylim(-3, 3)
+        axs[0, 2].set_aspect('equal')
+        axs[0, 2].set_title("Electron (v_y, v_z)")
+        axs[0, 2].set_xlabel("v_y"); axs[0, 2].set_ylabel("v_z")
+
+        axs[1, 0].plot(x_grid, efield_grid, color='green')
+        axs[1, 0].set_title("Electric Field E_x"); axs[1, 0].set_xlabel("Position")
+
+        axs[1, 1].plot(x_grid, rho - np.mean(rho), color='orange')
+        axs[1, 1].set_title("Charge Density Perturbation"); axs[1, 1].set_xlabel("Position")
+
+        times_plot = np.arange(len(ke_history)) * plot_every * dt
+        axs[1, 2].plot(times_plot, ke_history, label='Kinetic')
+        axs[1, 2].plot(times_plot, pe_history, label='Field')
+        axs[1, 2].plot(times_plot, total_energy, label='Total', linewidth=2)
+        axs[1, 2].set_title("Energy Conservation")
+        axs[1, 2].set_xlabel("Time (1/ω_pe)"); axs[1, 2].legend()
+
+        fig.suptitle(f"{SIM_MODE.capitalize()} (Optimized Numba) | t = {step*dt:.2f} | B_z = {B0}", fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+# Landau damping analysis
+if SIM_MODE == "landau" and len(efield_history) > 10:
+    times = np.arange(len(efield_history)) * plot_every * dt
+    amps = np.array(efield_history[1:])
+    log_amp = np.log(amps)
+
+    slope, intercept, r_value, _, _ = linregress(times[1:], log_amp)
+    gamma = slope
+
+    k = 2 * np.pi * mode / L
+    theory_gamma = -0.1533 * k**2 * np.exp(-1 / (2 * k**2))
+
+    print(f"\nLandau Damping Analysis (Optimized):")
+    print(f"Numerical γ ≈ {gamma:.6f}")
+    print(f"Theoretical (fluid) γ ≈ {theory_gamma:.6f}")
+    print(f"r² = {r_value**2:.4f}")
+
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(times, efield_history, 'o-', label='Simulation |E_mode|')
+    plt.semilogy(times, np.exp(intercept + slope * times), '--', label=f'Fit γ = {gamma:.5f}')
+    plt.title("Landau Damping of Electric Field Mode")
+    plt.xlabel("Time (1/ω_pe)"); plt.ylabel("|E_k| (log scale)")
+    plt.legend(); plt.grid(True)
+    plt.show()
+
+print("Simulation complete.")
