@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""
+Research-Grade 1D Electrostatic Particle-in-Cell (PIC) Simulator v3.0
+Enhanced Monolithic Edition
+
+Key Enhancements:
+- JSON configuration support (create config.json to override defaults)
+- Reproducible runs via random seed
+- HDF5 output for full post-processing and reproducibility
+- Extended diagnostics: momentum conservation, mode amplitude history
+- Cleaner structure with clear sections
+- Improved live plotting (momentum drift)
+- Final energy conservation report
+- Robust Landau damping analysis
+- Maintains all original high-fidelity physics and Numba performance
+
+Units: ω_pe = 1, λ_De = 1, q_e = -1, m_e = 1
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+from numba import jit, prange
+import json
+import os
+import h5py
+from datetime import datetime
+
+# ====================== CONFIGURATION ======================
+DEFAULT_CONFIG = {
+    "L": 50.0,                  # Domain length (λ_De)
+    "NG": 512,                  # Grid points
+    "NP_E": 100000,             # Electron macro-particles
+    "dt": 0.05,                 # Time step
+    "steps": 2000,              # Total steps
+    "plot_every": 50,           # Live plot interval
+    "output_every": 50,         # HDF5 save interval
+    "output_dir": "pic_output", # Output directory
+    "mi_me": 1836.0,            # Ion/electron mass ratio
+    "B0": 1.0,                  # Background B_z (ω_ce = ω_pe)
+    "mode": 2,                  # Excited mode number
+    "amp": 0.05,                # Perturbation amplitude
+    "SIM_MODE": "landau",       # "landau", "two_stream", "cyclotron_test"
+    "seed": 42                  # For reproducibility
+}
+
+def load_config(config_file=None):
+    if config_file and os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            user_config = json.load(f)
+        config = DEFAULT_CONFIG.copy()
+        config.update(user_config)
+        print(f"Loaded configuration from {config_file}")
+    else:
+        config = DEFAULT_CONFIG.copy()
+        print("Using default configuration")
+    return config
+
+config = load_config('config.json' if os.path.exists('config.json') else None)
+
+# Extract parameters
+L = config["L"]
+NG = config["NG"]
+dx = L / NG
+x_grid = np.linspace(0, L, NG, endpoint=False)
+
+NP_E = config["NP_E"]
+NP_I = NP_E
+NP_TOTAL = NP_E + NP_I
+
+dt = config["dt"]
+steps = config["steps"]
+plot_every = config["plot_every"]
+output_every = config["output_every"]
+output_dir = config["output_dir"]
+
+mi_me = config["mi_me"]
+B0 = config["B0"]
+mode = config["mode"]
+amp = config["amp"]
+SIM_MODE = config["SIM_MODE"]
+seed = config["seed"]
+
+os.makedirs(output_dir, exist_ok=True)
+
+ppc = NP_TOTAL / NG
+print(f"Particles per cell: {ppc:.1f} (low noise regime)")
+
+# ====================== PARTICLE INITIALIZATION ======================
+def initialize_particles():
+    rng = np.random.default_rng(seed)
+    pos_e = rng.uniform(0, L, NP_E)
+    pos_i = rng.uniform(0, L, NP_I)
+    positions = np.concatenate([pos_e, pos_i]).astype(np.float64)
+
+    velocities = np.zeros((NP_TOTAL, 3), dtype=np.float64)
+
+    masses = np.concatenate([np.ones(NP_E), np.ones(NP_I) * mi_me])
+    charges = np.concatenate([-np.ones(NP_E), np.ones(NP_I)])
+
+    if SIM_MODE == "two_stream":
+        vel_e_x = np.where(rng.random(NP_E) < 0.5, 2.0, -2.0)
+        velocities[:NP_E, 0] = vel_e_x
+        positions[:NP_E] += 0.01 * np.sin(2 * np.pi * mode * pos_e / L)
+
+    elif SIM_MODE == "cyclotron_test":
+        vth_e = 1.0
+        vth_i = vth_e / np.sqrt(mi_me)
+        velocities[:NP_E] = rng.normal(0, vth_e, (NP_E, 3))
+        velocities[:NP_E, 0] += 1.0  # Drift
+        velocities[NP_I:] = rng.normal(0, vth_i, (NP_I, 3))
+
+    else:  # landau (default)
+        vth_e = 1.0
+        vth_i = vth_e / np.sqrt(mi_me)
+        velocities[:NP_E, 0] = rng.normal(0, vth_e, NP_E)
+        velocities[NP_I:, 0] = rng.normal(0, vth_i, NP_I)
+
+        k = 2 * np.pi * mode / L
+        pert_e = amp * np.cos(k * pos_e)
+        pert_i = amp * np.cos(k * pos_i) / np.sqrt(mi_me)
+        velocities[:NP_E, 0] += pert_e
+        velocities[NP_I:, 0] += pert_i
+
+    return positions, velocities, masses, charges
+
+positions, velocities, masses, charges = initialize_particles()
+
+# ====================== DIAGNOSTICS & OUTPUT SETUP ======================
+ke_history = []
+pe_history = []
+total_energy = []
+momentum_history = []
+efield_mode_history = []
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+h5_path = os.path.join(output_dir, f"pic_run_{timestamp}.h5")
+h5_file = h5py.File(h5_path, "w")
+h5_file.attrs.update(config)
+h5_file.attrs['timestamp'] = timestamp
+h5_file.create_dataset("x_grid", data=x_grid)
+h5_file.create_dataset("times", shape=((steps // output_every) + 1,), dtype=np.float64)
+
+# ====================== NUMBA-ACCELERATED ROUTINES ======================
+@jit(nopython=True, parallel=True)
+def deposit_rho_tsc_numba(pos, q, dx, NG, rho_out):
+    rho_out.fill(0.0)
+    for i in prange(len(pos)):
+        x_norm = pos[i] / dx
+        j = int(np.floor(x_norm))
+        frac = x_norm - j
+
+        w_left = 0.5 * (0.5 + frac) ** 2
+        w_center = 0.75 - (frac - 0.5) ** 2
+        w_right = 0.5 * (0.5 - frac) ** 2
+
+        rho_out[(j - 1) % NG] += q[i] * w_left
+        rho_out[j % NG] += q[i] * w_center
+        rho_out[(j + 1) % NG] += q[i] * w_right
+
+@jit(nopython=True, parallel=True)
+def interpolate_field_tsc_numba(pos, field_grid, dx, NG, field_part_out):
+    for i in prange(len(pos)):
+        x_norm = pos[i] / dx
+        j = int(np.floor(x_norm))
+        frac = x_norm - j
+
+        w_left = 0.5 * (0.5 + frac) ** 2
+        w_center = 0.75 - (frac - 0.5) ** 2
+        w_right = 0.5 * (0.5 - frac) ** 2
+
+        field_part_out[i] = (field_grid[(j - 1) % NG] * w_left +
+                             field_grid[j % NG] * w_center +
+                             field_grid[(j + 1) % NG] * w_right)
+
+def binomial_filter_3pass(arr):
+    filtered = arr.copy()
+    for _ in range(3):
+        temp = filtered.copy()
+        filtered[0] = 0.25 * temp[-1] + 0.5 * temp[0] + 0.25 * temp[1]
+        filtered[-1] = 0.25 * temp[-2] + 0.5 * temp[-1] + 0.25 * temp[0]
+        for i in range(1, NG - 1):
+            filtered[i] = 0.25 * temp[i - 1] + 0.5 * temp[i] + 0.25 * temp[i + 1]
+    return filtered
+
+def solve_efield(rho):
+    rho_hat = np.fft.rfft(rho)
+    k = 2 * np.pi * np.fft.rfftfreq(NG, dx)
+    k[0] = 1e-10
+    phi_hat = -rho_hat / (k ** 2)
+    phi_hat[0] = 0.0
+    phi = np.fft.irfft(phi_hat, n=NG)
+    efield = -np.gradient(phi, dx)
+    return efield
+
+@jit(nopython=True, parallel=True)
+def boris_push_numba(v, q, m, E_part, dt, B0):
+    q_over_m = q / m
+    v_minus = v + q_over_m[:, np.newaxis] * E_part[:, np.newaxis] * (dt / 2)
+
+    t_vec = q_over_m * (dt / 2) * B0
+    gamma2 = t_vec ** 2
+
+    v_prime_x = v_minus[:, 0] + v_minus[:, 1] * t_vec
+    v_prime_y = v_minus[:, 1] - v_minus[:, 0] * t_vec
+    v_prime_z = v_minus[:, 2]
+
+    t2 = 2.0 * t_vec / (1.0 + gamma2)
+
+    v_plus_x = v_minus[:, 0] + v_prime_y * t2
+    v_plus_y = v_minus[:, 1] - v_prime_x * t2
+    v_plus_z = v_minus[:, 2]
+
+    v_new = np.empty_like(v)
+    v_new[:, 0] = v_plus_x + q_over_m * E_part * (dt / 2)
+    v_new[:, 1] = v_plus_y
+    v_new[:, 2] = v_plus_z
+
+    return v_new
+
+# Pre-allocate work arrays
+rho = np.zeros(NG, dtype=np.float64)
+E_part = np.zeros(NP_TOTAL, dtype=np.float64)
+
+# ====================== MAIN SIMULATION LOOP ======================
+print(f"Starting {SIM_MODE} simulation | Output: {h5_path}")
+
+output_idx = 0
+for step in range(steps + 1):
+    # Charge deposition
+    deposit_rho_tsc_numba(positions, charges, dx, NG, rho)
+    rho = binomial_filter_3pass(rho)
+
+    # Field solve
+    efield_grid = solve_efield(rho)
+
+    # Field interpolation
+    interpolate_field_tsc_numba(positions, efield_grid, dx, NG, E_part)
+
+    # Particle push
+    velocities = boris_push_numba(velocities, charges, masses, E_part, dt, B0)
+    positions = (positions + velocities[:, 0] * dt) % L
+
+    # Diagnostics
+    if step % max(plot_every, output_every) == 0:
+        ke = 0.5 * np.sum(masses * np.sum(velocities ** 2, axis=1))
+        pe = 0.5 * np.sum(efield_grid ** 2) * dx
+        total_e = ke + pe
+        momentum = np.sum(masses * velocities[:, 0])
+
+        ke_history.append(ke)
+        pe_history.append(pe)
+        total_energy.append(total_e)
+        momentum_history.append(momentum)
+
+        # Mode amplitude
+        phase = np.exp(1j * 2 * np.pi * mode * x_grid / L)
+        E_mode_amp = np.abs(np.sum(efield_grid * phase) * dx / L)
+        efield_mode_history.append(E_mode_amp)
+
+    # HDF5 output
+    if step % output_every == 0:
+        time_val = step * dt
+        h5_file["times"][output_idx] = time_val
+        grp = h5_file.create_group(f"step_{output_idx:04d}")
+        grp.create_dataset("efield", data=efield_grid)
+        grp.create_dataset("rho_pert", data=rho - np.mean(rho))
+        grp.attrs["ke"] = ke
+        grp.attrs["pe"] = pe
+        grp.attrs["total_energy"] = total_e
+        grp.attrs["momentum"] = momentum
+        grp.attrs["E_mode_amp"] = E_mode_amp
+        output_idx += 1
+
+    # Live plotting
+    if step % plot_every == 0:
+        print(f"Step {step:4d} | t = {step*dt:.2f} | KE: {ke:.4f} | PE: {pe:.6f} | ΔE/E: {(total_e - total_energy[0])/total_energy[0]:.2e} | |E_{mode}|: {E_mode_amp:.6f}")
+
+        fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+        subsample = 20
+
+        axs[0, 0].scatter(positions[:NP_E:subsample], velocities[:NP_E:subsample, 0],
+                          s=1, alpha=0.6, color='blue')
+        axs[0, 0].set_xlim(0, L); axs[0, 0].set_ylim(-4, 4)
+        axs[0, 0].set_title("Electron Phase Space (x, v_x)")
+        axs[0, 0].set_xlabel("x"); axs[0, 0].set_ylabel("v_x")
+
+        axs[0, 1].scatter(positions[NP_E::subsample], velocities[NP_E::subsample, 0],
+                          s=1, alpha=0.6, color='red')
+        axs[0, 1].set_xlim(0, L); axs[0, 1].set_ylim(-0.2, 0.2)
+        axs[0, 1].set_title("Ion Phase Space (x, v_x)")
+        axs[0, 1].set_xlabel("x")
+
+        axs[0, 2].scatter(velocities[:NP_E:subsample, 1], velocities[:NP_E:subsample, 2],
+                          s=1, alpha=0.6, color='purple')
+        axs[0, 2].set_xlim(-3, 3); axs[0, 2].set_ylim(-3, 3)
+        axs[0, 2].set_aspect('equal')
+        axs[0, 2].set_title("Electron (v_y, v_z)")
+        axs[0, 2].set_xlabel("v_y"); axs[0, 2].set_ylabel("v_z")
+
+        axs[1, 0].plot(x_grid, efield_grid, color='green')
+        axs[1, 0].set_title("E_x"); axs[1, 0].set_xlabel("x")
+
+        axs[1, 1].plot(x_grid, rho - np.mean(rho), color='orange')
+        axs[1, 1].set_title("ρ perturbation"); axs[1, 1].set_xlabel("x")
+
+        times_plot = np.arange(len(ke_history)) * plot_every * dt
+        axs[1, 2].plot(times_plot, ke_history, label='KE')
+        axs[1, 2].plot(times_plot, pe_history, label='PE')
+        axs[1, 2].plot(times_plot, total_energy, label='Total', lw=2)
+        axs[1, 2].plot(times_plot, np.array(momentum_history) - momentum_history[0], label='Δp_x', ls='--')
+        axs[1, 2].set_title("Conservation")
+        axs[1, 2].set_xlabel("Time (ω_pe⁻¹)")
+        axs[1, 2].legend()
+
+        fig.suptitle(f"{SIM_MODE.capitalize()} | t = {step*dt:.2f} ω_pe⁻¹ | B_z = {B0}", fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+h5_file.close()
+
+# ====================== POST-SIMULATION ANALYSIS ======================
+if SIM_MODE == "landau" and len(efield_mode_history) > 10:
+    times = np.arange(len(efield_mode_history)) * output_every * dt
+    amps = np.array(efield_mode_history)
+    log_amp = np.log(amps[1:])  # Skip t=0 if too large
+
+    slope, intercept, r_value, _, _ = linregress(times[1:], log_amp)
+    gamma_num = slope
+
+    k = 2 * np.pi * mode / L
+    gamma_theory = -0.1533 * k**2 * np.exp(-1 / (2 * k**2))
+
+    print(f"\n=== Landau Damping Validation ===")
+    print(f"Numerical growth rate γ = {gamma_num:.6f}")
+    print(f"Theoretical (fluid) γ   = {gamma_theory:.6f}")
+    print(f"Agreement (relative error): {abs(gamma_num - gamma_theory)/abs(gamma_theory):.2%}")
+    print(f"Fit R² = {r_value**2:.4f}")
+
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(times, amps, 'o-', label='Simulation')
+    plt.semilogy(times[1:], np.exp(intercept + slope * times[1:]), '--', label=f'Fit γ = {gamma_num:.5f}')
+    plt.title("Landau Damping of Electric Field Mode")
+    plt.xlabel("Time (ω_pe⁻¹)"); plt.ylabel("|E_k|")
+    plt.grid(True); plt.legend()
+    plt.show()
+
+# Final conservation report
+if total_energy:
+    rel_error = (np.max(total_energy) - np.min(total_energy)) / np.mean(total_energy)
+    print(f"\n=== Final Diagnostics ===")
+    print(f"Relative total energy fluctuation: {rel_error:.2e}")
+    print(f"Momentum drift: {momentum_history[-1] - momentum_history[0]:.2e}")
+
+print(f"\nSimulation complete. Full data saved to:\n  {h5_path}")
